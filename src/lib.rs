@@ -275,6 +275,7 @@ impl ProofOfHeart {
         let campaign = Campaign {
             id: count,
             creator: creator.clone(),
+            original_creator: creator.clone(),
             pending_creator: MaybePendingCreator::None,
             title: title.clone(),
             description,
@@ -297,9 +298,12 @@ impl ProofOfHeart {
         set_campaign_start_time(&env, count, env.ledger().timestamp());
         set_campaign_count(&env, count);
         set_revenue_pool(&env, count, 0);
-        let mut category_campaigns = get_category_campaigns(&env, category);
-        category_campaigns.push_back(count);
-        set_category_campaigns(&env, category, &category_campaigns);
+        let category_count = get_category_campaign_count(&env, category);
+        let bucket_idx = category_count / CATEGORY_CAMPAIGNS_BUCKET_SIZE;
+        let mut bucket = get_category_campaign_bucket(&env, category, bucket_idx);
+        bucket.push_back(count);
+        set_category_campaign_bucket(&env, category, bucket_idx, &bucket);
+        set_category_campaign_count(&env, category, category_count + 1);
 
         let creator_count = get_creator_campaign_count(&env, &creator);
         let bucket_idx = creator_count / CREATOR_CAMPAIGNS_BUCKET_SIZE;
@@ -348,7 +352,7 @@ impl ProofOfHeart {
         }
 
         require_active_campaign(&campaign)?;
-        if contributor == campaign.creator {
+        if contributor == campaign.creator || contributor == campaign.original_creator {
             return Err(Error::NotAuthorized);
         }
         if env.ledger().timestamp() > campaign.deadline {
@@ -1308,12 +1312,21 @@ impl ProofOfHeart {
         let _campaign = get_campaign_or_error(&env, campaign_id)?;
         bump_instance_ttl(&env);
         set_personal_cap(&env, campaign_id, &contributor, amount);
+        env.events().publish(("personal_cap_set", campaign_id, contributor), amount);
         Ok(())
     }
 
     /// Gets the personal contribution cap for a contributor on a campaign.
     pub fn get_personal_cap(env: Env, campaign_id: u32, contributor: Address) -> i128 {
         get_personal_cap(&env, campaign_id, &contributor).unwrap_or(0)
+    }
+
+    /// Returns the reserve details for a campaign, if any.
+    pub fn get_campaign_reserve(
+        env: Env,
+        campaign_id: u32,
+    ) -> Option<CampaignReserve> {
+        storage::get_campaign_reserve(&env, campaign_id)
     }
 
     /// Initiates transfer of admin privileges to a new address.
@@ -1591,8 +1604,7 @@ impl ProofOfHeart {
             return campaigns;
         }
 
-        let ids = get_category_campaigns(&env, category);
-        let total = ids.len();
+        let total = get_category_campaign_count(&env, category);
         if start >= total {
             return campaigns;
         }
@@ -1603,13 +1615,30 @@ impl ProofOfHeart {
             start + limit
         };
 
-        let mut idx = start;
-        while idx < end {
-            let campaign_id = ids.get(idx).unwrap();
-            if let Some(campaign) = get_campaign(&env, campaign_id) {
-                campaigns.push_back(campaign);
+        let mut position = start;
+        while position < end {
+            let bucket_idx = position / CATEGORY_CAMPAIGNS_BUCKET_SIZE;
+            let bucket = get_category_campaign_bucket(&env, category, bucket_idx);
+            let bucket_start = bucket_idx * CATEGORY_CAMPAIGNS_BUCKET_SIZE;
+            let mut idx_in_bucket = position - bucket_start;
+
+            let bucket_len = bucket.len();
+            while idx_in_bucket < bucket_len && position < end {
+                let campaign_id = bucket.get(idx_in_bucket).unwrap();
+                if let Some(campaign) = get_campaign(&env, campaign_id) {
+                    campaigns.push_back(campaign);
+                }
+                idx_in_bucket += 1;
+                position += 1;
             }
-            idx += 1;
+
+            if idx_in_bucket >= bucket_len {
+                position = if bucket_len == 0 {
+                    bucket_start + CATEGORY_CAMPAIGNS_BUCKET_SIZE
+                } else {
+                    bucket_start + bucket_len
+                };
+            }
         }
 
         campaigns
