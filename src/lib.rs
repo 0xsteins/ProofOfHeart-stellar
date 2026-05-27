@@ -472,6 +472,18 @@ impl ProofOfHeart {
         let reserve_amount = (total_after_fee * (reserve_bps as i128)) / 10000;
         let creator_amount = total_after_fee - reserve_amount;
 
+        // Execute token transfers BEFORE marking campaign as withdrawn to prevent stuck state
+        let admin_addr = get_admin(&env);
+        let client = Self::token_client(&env);
+
+        client.transfer(&env.current_contract_address(), &admin_addr, &fee_amount);
+        client.transfer(
+            &env.current_contract_address(),
+            &campaign.creator,
+            &creator_amount,
+        );
+
+        // Update state only after successful external interactions
         campaign.funds_withdrawn = true;
         campaign.is_active = false;
         set_campaign(&env, campaign_id, &campaign);
@@ -494,16 +506,6 @@ impl ProofOfHeart {
 
         let total_raised = get_total_raised_global(&env);
         set_total_raised_global(&env, total_raised - campaign.amount_raised);
-
-        let admin_addr = get_admin(&env);
-        let client = Self::token_client(&env);
-
-        client.transfer(&env.current_contract_address(), &admin_addr, &fee_amount);
-        client.transfer(
-            &env.current_contract_address(),
-            &campaign.creator,
-            &creator_amount,
-        );
 
         env.events().publish(
             ("withdrawal", campaign_id, campaign.creator.clone()),
@@ -532,15 +534,17 @@ impl ProofOfHeart {
         let campaign = get_campaign_or_error(&env, campaign_id)?;
         campaign.creator.require_auth();
 
-        reserve.released = true;
-        set_campaign_reserve(&env, campaign_id, &reserve);
-
+        // Transfer funds BEFORE marking reserve as released to prevent stuck state
         let client = Self::token_client(&env);
         client.transfer(
             &env.current_contract_address(),
             &campaign.creator,
             &reserve.amount,
         );
+
+        // Update state only after successful external interaction
+        reserve.released = true;
+        set_campaign_reserve(&env, campaign_id, &reserve);
 
         env.events().publish(
             ("reserve_released", campaign_id, campaign.creator),
@@ -789,10 +793,13 @@ impl ProofOfHeart {
         }
 
         bump_instance_ttl(&env);
-        set_revenue_claimed(&env, campaign_id, &contributor, already_claimed + claimable);
 
+        // Transfer tokens BEFORE updating state to prevent balance wipe on failed transfer
         let client = Self::token_client(&env);
         client.transfer(&env.current_contract_address(), &contributor, &claimable);
+
+        // Update state only after successful external interaction
+        set_revenue_claimed(&env, campaign_id, &contributor, already_claimed + claimable);
 
         env.events().publish(
             ("revenue_claimed", campaign_id, contributor.clone()),
@@ -831,9 +838,7 @@ impl ProofOfHeart {
 
         bump_instance_ttl(&env);
 
-        // Transfer before updating state (checks-effects-interactions pattern).
-        // This ensures the creator's claimable balance is only cleared after a
-        // successful transfer, preventing permanent fund loss on transfer failure.
+        // Transfer tokens BEFORE updating state to prevent balance wipe on failed transfer
         let client = Self::token_client(&env);
         client.transfer(
             &env.current_contract_address(),
@@ -1316,7 +1321,10 @@ impl ProofOfHeart {
         let _campaign = get_campaign_or_error(&env, campaign_id)?;
         bump_instance_ttl(&env);
         set_personal_cap(&env, campaign_id, &contributor, amount);
-        env.events().publish(("personal_cap_set", campaign_id, contributor), amount);
+        env.events().publish(
+            ("personal_cap_set", campaign_id, contributor.clone()),
+            amount,
+        );
         Ok(())
     }
 
@@ -1572,31 +1580,38 @@ impl ProofOfHeart {
         let mut current_id = start + 1;
         let mut next_cursor = 0u32;
 
-        while collected < capped_limit && current_id <= total_count {
+        while current_id <= total_count {
+            // Cap the scan to MAX_SCAN_WINDOW to prevent DoS
+            if current_id > start + MAX_SCAN_WINDOW {
+                next_cursor = current_id;
+                break;
+            }
+
             if let Some(campaign) = get_campaign(&env, current_id) {
                 if campaign.is_active && !campaign.is_cancelled {
                     campaigns.push_back(campaign);
                     collected += 1;
+                    if collected >= capped_limit {
+                        // Limit satisfied: set cursor so caller can continue
+                        next_cursor = current_id + 1;
+                        break;
+                    }
                 }
             }
             current_id += 1;
-
-            // Cap the scan to MAX_SCAN_WINDOW to prevent DoS
-            if current_id > start + MAX_SCAN_WINDOW {
-                // We hit the scan cap - set continuation cursor
-                next_cursor = current_id;
-                break;
-            }
-        }
-
-        // If we finished naturally (no scan cap hit), clear the cursor
-        if next_cursor == 0 && collected < limit {
-            next_cursor = 0;
         }
 
         (campaigns, next_cursor)
     }
 
+    /// List campaigns in a specific category using exclusive-cursor semantics.
+    ///
+    /// # Arguments
+    /// * `start` - The last campaign ID already seen (exclusive cursor).
+    ///   - Pass `start = 0` for the first page.
+    ///   - Pass the last returned campaign ID as `start` for the next page.
+    ///
+    /// Caps the limit at LIST_MAX_LIMIT (50) to prevent pathological calls.
     pub fn get_campaigns_by_category(
         env: Env,
         category: Category,
@@ -1648,14 +1663,27 @@ impl ProofOfHeart {
         campaigns
     }
 
+    /// Returns platform-wide aggregate statistics.
+    ///
+    /// # Performance Notes
+    /// This function scans campaigns sequentially. To prevent DoS, the scan is capped at
+    /// MAX_SCAN_LIMIT campaigns. For platforms with > MAX_SCAN_LIMIT campaigns, the
+    /// reported counts represent a partial snapshot of the most recent campaigns.
+    /// For accurate full statistics, consider implementing incremental counters that
+    /// update whenever campaign state changes (create, verify, cancel, etc.).
     pub fn get_platform_stats(env: Env) -> PlatformStats {
         let total_campaigns = get_campaign_count(&env);
         let mut active_campaigns = 0u32;
         let mut verified_campaigns = 0u32;
         let mut cancelled_campaigns = 0u32;
 
+        // Cap scan window to prevent DoS - scans most recent campaigns first
+        // (iteration order: 1, 2, 3, ... total_campaigns)
+        const MAX_SCAN_LIMIT: u32 = 1000;
+        let scan_end = total_campaigns.min(MAX_SCAN_LIMIT);
+
         let mut id = 1u32;
-        while id <= total_campaigns {
+        while id <= scan_end {
             if let Some(campaign) = get_campaign(&env, id) {
                 if campaign.is_active && !campaign.is_cancelled {
                     active_campaigns += 1;
